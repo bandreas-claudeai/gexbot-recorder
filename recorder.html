@@ -1,0 +1,316 @@
+<title>GEX Unterwegs-Recorder</title>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #131a22; --text: #e6edf3; --muted: #8b98a5;
+    --accent: #2dd4bf; --danger: #f87171; --ok: #34d399;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f7f9fb; --panel: #ffffff; --text: #0b0f14; --muted: #5b6570;
+      --accent: #0f766e; --danger: #dc2626; --ok: #15803d;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0f14; --panel: #131a22; --text: #e6edf3; --muted: #8b98a5;
+    --accent: #2dd4bf; --danger: #f87171; --ok: #34d399;
+  }
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif;
+         padding: 16px; max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 1.1rem; margin: 0 0 16px; }
+  .panel { background: var(--panel); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
+  input[type=password], input[type=text] {
+    width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--muted);
+    background: transparent; color: var(--text); font-size: 1rem; box-sizing: border-box;
+  }
+  button { padding: 14px 20px; border-radius: 10px; border: none; font-size: 1rem;
+           font-weight: 600; cursor: pointer; width: 100%; margin-top: 8px; }
+  #toggleBtn.stopped { background: var(--accent); color: #002; }
+  #toggleBtn.running { background: var(--danger); color: #200; }
+  #toggleBtn:disabled { background: var(--muted); color: var(--bg); cursor: not-allowed; }
+  .row { display: flex; justify-content: space-between; font-size: 0.85rem;
+         padding: 4px 0; border-bottom: 1px solid rgba(128,128,128,0.2); }
+  .row:last-child { border-bottom: none; }
+  .err { color: var(--danger); }
+  .ok { color: var(--ok); }
+</style>
+
+<h1>GEX Unterwegs-Recorder</h1>
+
+<div class="panel">
+  <label for="token">GEXBot API Token</label>
+  <input type="password" id="token" placeholder="Bearer-Token" autocomplete="off">
+</div>
+
+<div class="panel">
+  <button id="toggleBtn" class="stopped">Aufzeichnung starten</button>
+  <div id="pointCount" style="text-align:center; color:var(--muted); margin-top:8px; font-size:0.85rem;">
+    0 Punkte aufgezeichnet
+  </div>
+</div>
+
+<div class="panel" id="statusPanel">
+  <div class="row"><span>ES Index</span><span id="st-ES_SPX-index">–</span></div>
+  <div class="row"><span>ES ETF</span><span id="st-ES_SPX-etf">–</span></div>
+  <div class="row"><span>NQ Index</span><span id="st-NQ_NDX-index">–</span></div>
+  <div class="row"><span>NQ ETF</span><span id="st-NQ_NDX-etf">–</span></div>
+</div>
+
+<div class="panel">
+  <button id="exportBtn">Exportieren</button>
+  <button id="clearBtn" style="background:transparent; border:1px solid var(--muted); color:var(--muted);">Aufzeichnung löschen</button>
+</div>
+
+<script>
+// ─── Speicherung ────────────────────────────────────────────────────────
+// Alles bleibt ausschliesslich im Browser des Handys. Das Token geht nur direkt
+// an api.gexbot.com/api.gex.bot raus, nie an einen eigenen Server.
+function loadToken() { try { return localStorage.getItem('gexbot_token') || ''; } catch { return ''; } }
+function saveToken(v) { try { localStorage.setItem('gexbot_token', v); } catch {} }
+function getRecords() {
+  try { return JSON.parse(localStorage.getItem('gexbot_records') || '[]'); }
+  catch { return []; }
+}
+function appendRecord(rec) {
+  const all = getRecords();
+  all.push(rec);
+  let stored = true;
+  try { localStorage.setItem('gexbot_records', JSON.stringify(all)); }
+  catch { stored = false; }
+  const cnt = document.getElementById('pointCount');
+  if (stored) {
+    cnt.textContent = all.length + ' Punkte aufgezeichnet';
+    cnt.className = '';
+  } else {
+    // localStorage voll (Browser-Limit ca. 5 MB) - der neue Punkt ging verloren,
+    // das muss sichtbar sein statt still zu verschwinden.
+    cnt.textContent = 'Speicher voll! Bitte jetzt exportieren und loeschen.';
+    cnt.className = 'err';
+  }
+}
+function clearRecords() {
+  try { localStorage.removeItem('gexbot_records'); } catch {}
+  const cnt = document.getElementById('pointCount');
+  cnt.textContent = '0 Punkte aufgezeichnet';
+  cnt.className = '';
+}
+
+const tokenInput = document.getElementById('token');
+tokenInput.value = loadToken();
+tokenInput.addEventListener('input', () => saveToken(tokenInput.value));
+
+// ─── Start/Stopp + sichtbarkeitsabhaengiges Polling ────────────────────
+// Handy-Browser drosseln Hintergrund-Tabs stark - das Poll-Intervall laeuft daher nur,
+// solange die Seite sichtbar ist. Beim Sperren/Wechseln pausiert es automatisch (der
+// Interval-Timer wird gestoppt), beim Zurueckkommen startet es neu - keine Faelschung
+// von Datenpunkten fuer die pausierte Zeit.
+let running = false;
+let pollTimer = null;
+const POLL_MS = 30000;
+
+// ─── GEXBot-Abruf ───────────────────────────────────────────────────────
+// Nur Classic (period=zero) - die sieben Level, die beim aktuellen Abo (Classic+State,
+// kein Orderflow) tatsaechlich befuellt sind. Siehe Spec, Abschnitt "Ausgangslage".
+const TICKERS = [
+  { ticker: 'ES_SPX', apiIndex: 'ES_SPX', apiEtf: 'SPY', futureCode: 'ES' },
+  { ticker: 'NQ_NDX', apiIndex: 'NQ_NDX', apiEtf: 'QQQ', futureCode: 'NQ' },
+];
+const convCache = {}; // { ES: {mult, add, lastFetch}, NQ: {...} }
+const CONV_MAX_AGE_MS = 15 * 60 * 1000;
+
+async function fetchJson(url) {
+  const token = loadToken();
+  const res = await fetch(url, {
+    headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error('HTTP ' + res.status + ' ' + res.statusText + ': ' + body.slice(0, 150));
+  }
+  return res.json();
+}
+
+// Extrahiert die sieben Level aus einer classic/zero-Antwort. Preise unumgerechnet
+// (SPY/QQQ-Skala bei ETF) - die Umrechnung passiert separat in applyConversion.
+// Ein Level ohne Wert (0 oder fehlend) wird NICHT in das Ergebnis aufgenommen.
+function extractLevels(classicJson) {
+  const out = {};
+  function put(name, value) {
+    if (typeof value === 'number' && value > 0) out[name] = value;
+  }
+  put('MajPosVol', classicJson.major_pos_vol);
+  put('MajNegVol', classicJson.major_neg_vol);
+  put('MajPosOI',  classicJson.major_pos_oi);
+  put('MajNegOI',  classicJson.major_neg_oi);
+  put('ZeroGamma', classicJson.zero_gamma);
+
+  // MaxGexPlus/MaxGexMinus: Strike mit groesstem bzw. kleinstem Volumen aus der
+  // strikes-Liste (dieselbe Regel wie im PC-Indikator, CollectMajor-Vorstufe).
+  const strikes = Array.isArray(classicJson.strikes) ? classicJson.strikes : [];
+  let maxVol = -Infinity, maxPrice = 0, minVol = Infinity, minPrice = 0;
+  for (const s of strikes) {
+    if (!Array.isArray(s) || s.length < 2) continue;
+    const price = s[0], vol = s[1];
+    if (typeof price !== 'number' || price <= 0) continue;
+    if (vol > maxVol) { maxVol = vol; maxPrice = price; }
+    if (vol < minVol) { minVol = vol; minPrice = price; }
+  }
+  put('MaxGexPlus', maxPrice);
+  put('MaxGexMinus', minPrice);
+  return out;
+}
+
+// Wendet die affine Futures-Umrechnung an (raw*mult+add), fuer jedes Level in "levels".
+function applyConversion(levels, mult, add) {
+  const out = {};
+  for (const k in levels) out[k] = levels[k] * mult + add;
+  return out;
+}
+
+// Dieselbe Groessenordnungs-Pruefung wie EtfConversionCheck.IsPlausible im
+// PC-Indikator: eine falsch angebotene Umrechnung wuerde SPY/QQQ-Rohpreise
+// als vermeintliche ES/NQ-Level in die History schreiben, ohne dass man es der
+// Zahl ansieht - deshalb NIE eine unplausible Umrechnung verwenden oder cachen.
+function isPlausibleConversion(futureCode, mult, add) {
+  if (!Number.isFinite(mult) || !Number.isFinite(add)) return false;
+  if (futureCode === 'ES') return mult >= 8.0  && mult <= 13.0;
+  if (futureCode === 'NQ') return mult >= 30.0 && mult <= 50.0;
+  return false;
+}
+
+async function refreshConversion(futureCode, apiTicker) {
+  const cached = convCache[futureCode];
+  if (cached && (Date.now() - cached.lastFetch) < CONV_MAX_AGE_MS) return cached;
+  const url = `https://api.gex.bot/v2/futures/conversion?ticker=${apiTicker}&future=${futureCode}&model=affine`;
+  const conv = await fetchJson(url);
+  const mult = Number(conv.multiplier);
+  const add  = Number(conv.additive);
+  if (isPlausibleConversion(futureCode, mult, add)) {
+    convCache[futureCode] = { mult, add, lastFetch: Date.now() };
+    return convCache[futureCode];
+  }
+  return cached || null;
+}
+
+// Baut einen exportfertigen Datensatz. Bei ETF zusaetzlich ConvMult/ConvAdd und je
+// Level ein <Level>Raw-Feld - dieselbe Konvention wie der PC-ETF-DataLog, damit das
+// Einspiel-Skript denselben Code fuer beide Quellen nutzen kann.
+function buildRecord(ticker, src, rawLevels, convMult, convAdd) {
+  const rec = { Timestamp: new Date().toISOString(), Ticker: ticker, Src: src };
+  const levels = src === 'etf' ? applyConversion(rawLevels, convMult, convAdd) : rawLevels;
+  for (const k in levels) {
+    rec[k] = levels[k];
+    if (src === 'etf') rec[k + 'Raw'] = rawLevels[k];
+  }
+  if (src === 'etf') { rec.ConvMult = convMult; rec.ConvAdd = convAdd; }
+  return rec;
+}
+
+function setStatus(ticker, src, text, isError) {
+  const el = document.getElementById('st-' + ticker + '-' + src);
+  if (!el) return;
+  el.textContent = text;
+  el.className = isError ? 'err' : 'ok';
+}
+
+async function pollOnce() {
+  for (const t of TICKERS) {
+    // Index
+    try {
+      const classic = await fetchJson(`https://api.gexbot.com/${t.apiIndex}/classic/zero`);
+      const levels = extractLevels(classic);
+      appendRecord(buildRecord(t.ticker, 'index', levels, 1, 0));
+      setStatus(t.ticker, 'index', new Date().toLocaleTimeString(), false);
+    } catch (e) {
+      setStatus(t.ticker, 'index', String(e.message || e), true);
+    }
+
+    // ETF
+    try {
+      const classic = await fetchJson(`https://api.gexbot.com/${t.apiEtf}/classic/zero`);
+      const rawLevels = extractLevels(classic);
+      const conv = await refreshConversion(t.futureCode, t.apiEtf);
+      if (!conv) {
+        setStatus(t.ticker, 'etf', 'Umrechnung unplausibel', true);
+      } else {
+        appendRecord(buildRecord(t.ticker, 'etf', rawLevels, conv.mult, conv.add));
+        setStatus(t.ticker, 'etf', new Date().toLocaleTimeString(), false);
+      }
+    } catch (e) {
+      setStatus(t.ticker, 'etf', String(e.message || e), true);
+    }
+  }
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  pollOnce();
+  pollTimer = setInterval(pollOnce, POLL_MS);
+}
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!running) return;
+  if (document.visibilityState === 'visible') startPolling();
+  else stopPolling();
+});
+
+const toggleBtn = document.getElementById('toggleBtn');
+toggleBtn.addEventListener('click', () => {
+  running = !running;
+  if (running) {
+    toggleBtn.textContent = 'Aufzeichnung stoppen';
+    toggleBtn.className = 'running';
+    if (document.visibilityState === 'visible') startPolling();
+  } else {
+    toggleBtn.textContent = 'Aufzeichnung starten';
+    toggleBtn.className = 'stopped';
+    stopPolling();
+  }
+});
+
+document.getElementById('pointCount').textContent = getRecords().length + ' Punkte aufgezeichnet';
+
+// ─── Export ─────────────────────────────────────────────────────────────
+// Diese Seite laeuft als normal gehostete Webseite (nicht als Claude-Artifact -
+// dessen Sandbox blockiert per Content-Security-Policy jeden fetch() zu einer
+// fremden Domain wie api.gexbot.com, unabhaengig von deren eigener CORS-Freigabe).
+// Als normale Seite funktioniert der ganz gewoehnliche <a download>-Weg ueber einen
+// Blob: kein Server, keine Capability noetig.
+document.getElementById('exportBtn').addEventListener('click', () => {
+  const btn = document.getElementById('exportBtn');
+  const records = getRecords();
+  if (records.length === 0) {
+    btn.textContent = 'Keine Punkte aufgezeichnet';
+    setTimeout(() => { btn.textContent = 'Exportieren'; }, 2000);
+    return;
+  }
+  const filename = 'gexbot_mobile_' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+  const blob = new Blob([JSON.stringify(records)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  btn.textContent = 'Exportiert (' + records.length + ' Punkte)';
+  setTimeout(() => { btn.textContent = 'Exportieren'; }, 3000);
+});
+
+// ─── Loeschen ───────────────────────────────────────────────────────────
+// Ohne Loeschen bleibt jede Aufzeichnung fuer immer im Speicher - der naechste
+// Export enthaelt dann alte, bereits eingespielte Punkte, und das Einspiel-Skript
+// bricht mit "liegt vor dem letzten PC-Eintrag" ab. Deshalb erst nach erfolgreichem
+// Einspielen loeschen (README), manuell mit Bestaetigung, kein automatisches Loeschen.
+document.getElementById('clearBtn').addEventListener('click', () => {
+  const records = getRecords();
+  if (records.length === 0) return;
+  const ok = confirm('Aufzeichnung wirklich loeschen (' + records.length + ' Punkte)? '
+    + 'Nur machen, nachdem der Export erfolgreich am PC eingespielt wurde.');
+  if (ok) clearRecords();
+});
+</script>
