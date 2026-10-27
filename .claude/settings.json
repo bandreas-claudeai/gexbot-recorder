@@ -11,11 +11,18 @@
         "source": "github",
         "repo": "mksglu/context-mode"
       }
+    },
+    "caveman": {
+      "source": {
+        "source": "github",
+        "repo": "JuliusBrussee/caveman"
+      }
     }
   },
   "enabledPlugins": {
     "ponytail@ponytail": true,
-    "context-mode@context-mode": true
+    "context-mode@context-mode": true,
+    "caveman@caveman": true
   },
   "statusLine": {
     "type": "command",
