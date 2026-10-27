@@ -16,5 +16,9 @@
   "enabledPlugins": {
     "ponytail@ponytail": true,
     "context-mode@context-mode": true
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "context-mode statusline"
   }
 }
