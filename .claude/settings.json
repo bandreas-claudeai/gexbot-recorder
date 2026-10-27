@@ -5,9 +5,16 @@
         "source": "github",
         "repo": "DietrichGebert/ponytail"
       }
+    },
+    "context-mode": {
+      "source": {
+        "source": "github",
+        "repo": "mksglu/context-mode"
+      }
     }
   },
   "enabledPlugins": {
-    "ponytail@ponytail": true
+    "ponytail@ponytail": true,
+    "context-mode@context-mode": true
   }
 }
